@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import argparse
+import json
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+
+from export_position_pca_review_pairgrid import (
+    DEFAULT_QUESTION,
+    DEFAULT_SYSTEM_PROMPT,
+    build_prefix_ids,
+    compute_pair_end_variances,
+    compute_pair_score,
+    compute_pca_coords,
+    select_farthest_endpoint_representatives,
+)
+from export_position_pca_review_figures import apply_publication_style
+from vis import clean_output_text, collect_generated_token_traces, sample_next_token_predictions, collect_next_token_trajectories
+
+
+def parse_int_list(value: str) -> list[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_float_list(value: str) -> list[float]:
+    return [float(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Search for output positions that yield visibly separated PCA landscapes.")
+    parser.add_argument("--model-dir", type=Path, default=Path("/data/hansen/serv12/HRM-Deq/models/huginn-0125"))
+    parser.add_argument("--output-path", type=Path, default=Path("outputs/rebuttal_ar_figures/visible_landscape_search.json"))
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--question", default=DEFAULT_QUESTION)
+    parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    parser.add_argument("--search-max-positions", type=int, default=64)
+    parser.add_argument("--search-num-samples", type=int, default=32)
+    parser.add_argument("--search-num-steps", type=int, default=32)
+    parser.add_argument("--full-num-samples", type=int, default=256)
+    parser.add_argument("--full-num-steps", type=int, default=32)
+    parser.add_argument("--sample-batch-size", type=int, default=32)
+    parser.add_argument("--init-std-scales", default="12,16,20")
+    parser.add_argument("--pca-dims", default="6,8,10")
+    parser.add_argument("--max-candidates-per-scale", type=int, default=6)
+    parser.add_argument("--min-minority-fraction", type=float, default=0.08)
+    parser.add_argument("--ranking-objective", choices=("end_var", "pair_score"), default="pair_score")
+    return parser.parse_args()
+
+
+def token_counts_to_labels(tokenizer: AutoTokenizer, counts: list[tuple[int, int]]) -> list[tuple[str, int]]:
+    return [(tokenizer.decode([token_id], skip_special_tokens=False), int(count)) for token_id, count in counts]
+
+
+def main() -> None:
+    args = parse_args()
+    apply_publication_style()
+    torch.manual_seed(args.seed)
+
+    init_scales = parse_float_list(args.init_std_scales)
+    pca_dims = parse_int_list(args.pca_dims)
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print("[search] loading model...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_dir,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map={"": args.device},
+    )
+    model.eval()
+    print("[search] model loaded")
+
+    messages = []
+    if args.system_prompt.strip():
+        messages.append({"role": "system", "content": args.system_prompt.strip()})
+    messages.append({"role": "user", "content": args.question.strip()})
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    input_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(args.device)
+
+    generation_config = GenerationConfig(
+        max_new_tokens=128,
+        stop_strings=["<|end_text|>", "<|end_turn|>"],
+        do_sample=False,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        min_p=None,
+        return_dict_in_generate=True,
+        eos_token_id=65505,
+        bos_token_id=65504,
+        pad_token_id=65509,
+    )
+    generated_trace = collect_generated_token_traces(
+        model=model,
+        tokenizer=tokenizer,
+        input_ids=input_ids.clone(),
+        generation_config=generation_config,
+        num_steps=12,
+        max_new_tokens=128,
+        init_scale=0.0,
+    )
+    generated_token_ids = generated_trace["generated_token_ids"].tolist()
+    generated_text = clean_output_text(tokenizer.decode(generated_token_ids, skip_special_tokens=False))
+    max_positions = min(args.search_max_positions, len(generated_token_ids))
+
+    all_results: list[dict] = []
+
+    for init_scale in init_scales:
+        print(f"[search] scan init_scale={init_scale}")
+        search_candidates: list[dict] = []
+        for position in range(max_positions):
+            prefix_ids = build_prefix_ids(input_ids, generated_token_ids, position)
+            pred = sample_next_token_predictions(
+                model=model,
+                input_ids=prefix_ids,
+                num_samples=args.search_num_samples,
+                num_steps=args.search_num_steps,
+                init_scale=init_scale,
+                batch_size=args.sample_batch_size,
+            )
+            counts = Counter(pred.tolist()).most_common(5)
+            if len(counts) < 2:
+                continue
+            mode_fraction = counts[0][1] / args.search_num_samples
+            minority_fraction = counts[1][1] / args.search_num_samples
+            search_candidates.append(
+                {
+                    "position": position,
+                    "reference_token": tokenizer.decode([generated_token_ids[position]], skip_special_tokens=False),
+                    "search_top_tokens": token_counts_to_labels(tokenizer, counts),
+                    "search_mode_fraction": mode_fraction,
+                    "search_minority_fraction": minority_fraction,
+                }
+            )
+        search_candidates.sort(
+            key=lambda item: (
+                -item["search_minority_fraction"],
+                item["search_mode_fraction"],
+                item["position"],
+            )
+        )
+        search_candidates = search_candidates[: args.max_candidates_per_scale]
+        print(f"[search] init_scale={init_scale} candidates={len(search_candidates)}")
+
+        for candidate in search_candidates:
+            position = candidate["position"]
+            prefix_ids = build_prefix_ids(input_ids, generated_token_ids, position)
+            print(f"[search] full eval position={position} init_scale={init_scale}")
+            trace = collect_next_token_trajectories(
+                model=model,
+                input_ids=prefix_ids,
+                num_samples=args.full_num_samples,
+                num_steps=args.full_num_steps,
+                init_scale=init_scale,
+                batch_size=args.sample_batch_size,
+            )
+            pred = trace["predicted_token_ids"].cpu()
+            counts = Counter(pred.tolist()).most_common(5)
+            minority_fraction = counts[1][1] / args.full_num_samples if len(counts) >= 2 else 0.0
+            if len(counts) < 2 or minority_fraction < args.min_minority_fraction:
+                print(f"[search] skip position={position} init_scale={init_scale} minority_fraction={minority_fraction:.3f}")
+                continue
+
+            candidate_result = {
+                "position": position,
+                "reference_token": candidate["reference_token"],
+                "init_scale": init_scale,
+                "full_top_tokens": token_counts_to_labels(tokenizer, counts),
+                "full_mode_fraction": counts[0][1] / args.full_num_samples,
+                "full_minority_fraction": minority_fraction,
+                "dims": [],
+            }
+
+            for dim in pca_dims:
+                projected = compute_pca_coords(trace["states"], n_components=dim, whiten=False)
+                coords = projected["coords"].numpy()
+                final_coords = coords[:, -1, :]
+                overlay = select_farthest_endpoint_representatives(final_coords, pred, max_tokens=2)
+                pair_vars = compute_pair_end_variances({"coords": coords, "predicted_token_ids": pred}, overlay)
+                pair_scores = []
+                for row in range(dim):
+                    for col in range(dim):
+                        if row == col:
+                            continue
+                        score = compute_pair_score(final_coords, pred, (row, col), min_group_size=2)
+                        if score is not None:
+                            pair_scores.append(score)
+                pair_scores.sort(key=lambda item: item["score"], reverse=True)
+                rep_endpoints = final_coords[overlay]
+                endpoint_distance = float(np.linalg.norm(rep_endpoints[0] - rep_endpoints[1])) if len(overlay) >= 2 else 0.0
+                top_pair = pair_vars[0] if pair_vars else None
+                top_pair_score = pair_scores[0] if pair_scores else None
+                if args.ranking_objective == "pair_score":
+                    ranking_score = float((top_pair_score["score"] if top_pair_score else 0.0) * minority_fraction)
+                else:
+                    ranking_score = float((top_pair["end_var"] if top_pair else 0.0) * minority_fraction)
+                dim_result = {
+                    "pca_dim": dim,
+                    "overlay_indices": overlay,
+                    "rep_endpoint_distance": endpoint_distance,
+                    "top_pair": top_pair,
+                    "top_pair_score": top_pair_score,
+                    "top3_pairs": pair_vars[:3],
+                    "score": ranking_score,
+                }
+                candidate_result["dims"].append(dim_result)
+
+            candidate_result["best_dim"] = max(candidate_result["dims"], key=lambda item: item["score"])
+            all_results.append(candidate_result)
+            print(
+                "[search] result",
+                json.dumps(
+                    {
+                        "position": position,
+                        "init_scale": init_scale,
+                        "full_top_tokens": candidate_result["full_top_tokens"][:2],
+                        "best_dim": candidate_result["best_dim"],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+    all_results.sort(
+        key=lambda item: (
+            item["best_dim"]["score"],
+            item["best_dim"]["top_pair_score"]["score"] if item["best_dim"]["top_pair_score"] else 0.0,
+            item["best_dim"]["top_pair"]["end_var"] if item["best_dim"]["top_pair"] else 0.0,
+            item["best_dim"]["rep_endpoint_distance"],
+        ),
+        reverse=True,
+    )
+
+    payload = {
+        "generated_text": generated_text,
+        "search_num_samples": args.search_num_samples,
+        "search_num_steps": args.search_num_steps,
+        "full_num_samples": args.full_num_samples,
+        "full_num_steps": args.full_num_steps,
+        "init_scales": init_scales,
+        "pca_dims": pca_dims,
+        "ranking_objective": args.ranking_objective,
+        "results": all_results,
+    }
+    args.output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(f"[search] wrote {args.output_path}")
+    if all_results:
+        print("[search] best candidate:", json.dumps(all_results[0], ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
